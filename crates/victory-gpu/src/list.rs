@@ -1276,8 +1276,10 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
         return;
     }
     let _ = this;
-    // Without a host GPU nothing runs later: write now.
+    // Without a host GPU nothing runs later: write now (maybe a fence's
+    // value).
     what.write(address as *mut u8, bytes);
+    crate::fence::poll();
 }
 
 /// The list methods by their slot in older titles' lists (the 2020-era

@@ -603,6 +603,8 @@ impl Host {
                 what.write(at as *mut u8, bytes);
             }
         }
+        // Some of those writes are fence values (signals by memory).
+        crate::fence::poll();
         self.log_messages();
     }
 

@@ -55,14 +55,6 @@ Check **Committed** under **Task Manager → Performance → Memory**. If
 `crashes.log` reports Windows error 1455, close other applications or increase
 the Windows paging file size, then retry.
 
-On Windows 10 the built-in D3D12 runtime is too old for the title's root
-signatures (`CreateRootSignature` fails with `E_INVALIDARG`). `victory.exe`
-opts into the D3D12 Agility SDK: copy `D3D12Core.dll` (and, for
-`VICTORY_D3D12_DEBUG`, `d3d12SDKLayers.dll`) from `build\native\bin\x64` of
-the [Microsoft.Direct3D.D3D12](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12)
-NuGet package, version 1.620.x, into a `D3D12` folder beside `victory.exe`.
-Windows 11 needs nothing extra.
-
 ```powershell
 cargo xtask install-hooks                # asset-policy check on every commit
 copy victory.example.toml victory.toml   # then set your paths (outside the repo)

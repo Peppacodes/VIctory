@@ -5664,6 +5664,19 @@ impl<'a> Lower<'a> {
         if uav && op != 66 {
             return Err("sampling a UAV");
         }
+        // Addresses before the coordinates: the offsets, the bias, the
+        // reference value.
+        let first = usize::from(name.ends_with("_o"))
+            + usize::from(name == "image_sample_b")
+            + usize::from(matches!(op, 64 | 65));
+        // A cube array's face operand holds the slice too, and its view is a
+        // cube array (DXIL kind 9).
+        let (kind, props) =
+            if kind == 5 && sample && self.cube_array_face(inst, &regs, first + 2, *a16) {
+                (9, (9, props.1))
+            } else {
+                (kind, props)
+            };
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
@@ -5683,8 +5696,6 @@ impl<'a> Lower<'a> {
             // Texel offsets (`_o`) come first: x in bits 0-5, y in 8-13,
             // signed (programmable offsets: gathers only).
             let offset_word = name.ends_with("_o");
-            let first =
-                usize::from(offset_word) + usize::from(name == "image_sample_b") + usize::from(cmp);
             // Coordinates the size divides (not the array slice); explicit
             // gradients (x then y) come before the coordinates.
             let spatial = coords - usize::from(kind == 6 || kind == 7);
@@ -5703,11 +5714,18 @@ impl<'a> Lower<'a> {
                 let x = addr_val(self, first + grads + k)?;
                 *slot = to_float(self, x);
             }
-            if kind == 5 {
+            if matches!(kind, 5 | 9) {
                 if *unorm || op == 63 || op == 81 {
                     return Err("a cube sample with texel coordinates, gradients or a level query");
                 }
-                let dir = self.cube_direction(cs[0], cs[1], cs[2]);
+                let face = if kind == 9 {
+                    let (slice, face) = self.cube_slice(cs[2]);
+                    cs[3] = slice;
+                    face
+                } else {
+                    cs[2]
+                };
+                let dir = self.cube_direction(cs[0], cs[1], face);
                 cs[..3].copy_from_slice(&dir);
             }
             if *unorm {
@@ -5745,7 +5763,7 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
-            let offsets = if kind == 5 {
+            let offsets = if matches!(kind, 5 | 9) {
                 0
             } else {
                 (coords - usize::from(kind == 6 || kind == 7)).min(3)
@@ -5945,12 +5963,77 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Whether a cube sample's face operand (address `at`) is a cube
+    /// array's, 8 × the slice + the face id: a constant of 8 or more, or a
+    /// multiply-add by 8.0, as titles build it. GFX10 images have no array
+    /// bit: a cube and a cube array differ only in this operand.
+    // shortcut: any other face operand is taken as a cube's (a bare face
+    // id), and 16-bit addresses always are.
+    fn cube_array_face(&mut self, inst: &Inst, regs: &[u8], at: usize, a16: bool) -> bool {
+        if a16 {
+            return false;
+        }
+        let Some(v) = regs.get(at).and_then(|&r| inst.read(Reg::V(r))) else {
+            return false;
+        };
+        if let Some(bits) = self.i32_of(v).ok().and_then(|x| self.s.m.int_value(x)) {
+            return f32::from_bits(bits as u32) >= 8.0;
+        }
+        let p = self.x.p;
+        let Some(def) = self.def_block.get(&v).and_then(|&b| {
+            p.blocks[b]
+                .insts
+                .iter()
+                .find(|i| i.writes.iter().any(|w| w.1 == v))
+        }) else {
+            return false;
+        };
+        let Fields::Valu(f) = &def.fields else {
+            return false;
+        };
+        let multiply_add = matches!(
+            def.name(),
+            "v_fma_f32"
+                | "v_fmac_f32"
+                | "v_fmamk_f32"
+                | "v_fmaak_f32"
+                | "v_mad_f32"
+                | "v_mac_f32"
+                | "v_madmk_f32"
+                | "v_madak_f32"
+        );
+        if !multiply_add || f.clamp || f.omod != 0 || f.sdwa.is_some() || f.dpp.is_some() {
+            return false;
+        }
+        // 8.0 as one of the factors (the first two operands), unmodified.
+        f.src.iter().take(2).enumerate().any(|(k, op)| {
+            (f.abs | f.neg) >> k & 1 == 0
+                && self
+                    .operand(def, op)
+                    .ok()
+                    .and_then(|x| self.s.m.int_value(x))
+                    == Some(0x4100_0000)
+        })
+    }
+
+    /// A cube array's slice and face id from its face operand, 8 × the
+    /// slice + the face id (Mesa's `prepare_cube_coords` builds it so).
+    fn cube_slice(&mut self, face: V) -> (V, V) {
+        let c = self.cur;
+        let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());
+        let (eighth, eight) = (k(self, 0.125), k(self, 8.0));
+        let x = self.s.m.bin(c, Bin::Mul, face, eighth);
+        let slice = self.unary(27, x);
+        let base = self.s.m.bin(c, Bin::Mul, slice, eight);
+        let id = self.s.m.bin(c, Bin::Sub, face, base);
+        (slice, id)
+    }
+
     /// The direction a cube sample's face coordinates stand for: the
     /// console takes s and t in [1, 2] (`v_cubesc`/`v_cubetc` over
-    /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`), which the
-    /// host's cube sampling turns back into the same texel.
-    // shortcut: the view is taken as a cube, not a cube array (whose face
-    // operand adds 8 × the slice).
+    /// `|v_cubema|`, plus 1.5) and the face id (`v_cubeid`; a cube array's
+    /// comes from [`Self::cube_slice`]), which the host's cube sampling
+    /// turns back into the same texel.
     fn cube_direction(&mut self, s: V, t: V, face: V) -> [V; 3] {
         let c = self.cur;
         let k = |l: &mut Self, v: f32| l.s.m.f32(v.to_bits());

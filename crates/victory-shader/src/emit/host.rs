@@ -905,6 +905,12 @@ fn transition(
     }
 }
 
+/// Held by tests that dispatch on the hardware adapter and WARP: from
+/// several test threads at once, now and then none of their dispatches
+/// ever completes and the test binary hangs.
+#[cfg(test)]
+pub static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A view in the heap for [`Host::dispatch`].
 #[cfg(test)]
 pub enum View<'a> {
@@ -912,6 +918,9 @@ pub enum View<'a> {
     Texture(u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, texels of faces +x -x +y -y +z -z).
     Cube(u32, &'a [[f32; 4]]),
+    /// An RGBA32F cube-array SRV (face size, cubes, texels of each cube's
+    /// faces in `Cube` order, cube after cube).
+    CubeArray(u32, u32, &'a [[f32; 4]]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
     /// An RGBA32F texture UAV (width, height), zeroed.
@@ -1085,10 +1094,11 @@ impl Host {
                 let mut at = views.GetCPUDescriptorHandleForHeapStart();
                 at.ptr += i * view_size;
                 match *v {
-                    View::Texture(..) | View::Cube(..) => {
+                    View::Texture(..) | View::Cube(..) | View::CubeArray(..) => {
                         let (w, h, texels, faces) = match *v {
                             View::Texture(w, h, t) => (w, h, t, 1),
                             View::Cube(n, t) => (n, n, t, 6),
+                            View::CubeArray(n, cubes, t) => (n, n, t, 6 * cubes),
                             _ => unreachable!(),
                         };
                         let mut desc = texture(w, h, D3D12_RESOURCE_FLAG_NONE);
@@ -1134,20 +1144,35 @@ impl Host {
                             D3D12_RESOURCE_STATE_COPY_DEST,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         )]);
-                        let cube = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
-                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
-                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                                TextureCube: D3D12_TEXCUBE_SRV {
-                                    MipLevels: 1,
-                                    ..Default::default()
+                        let cube = match *v {
+                            View::Cube(..) => Some(D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                    TextureCube: D3D12_TEXCUBE_SRV {
+                                        MipLevels: 1,
+                                        ..Default::default()
+                                    },
                                 },
-                            },
+                            }),
+                            View::CubeArray(_, cubes, _) => Some(D3D12_SHADER_RESOURCE_VIEW_DESC {
+                                Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                                ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBEARRAY,
+                                Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                                Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                    TextureCubeArray: D3D12_TEXCUBE_ARRAY_SRV {
+                                        MipLevels: 1,
+                                        NumCubes: cubes,
+                                        ..Default::default()
+                                    },
+                                },
+                            }),
+                            _ => None,
                         };
                         dev.CreateShaderResourceView(
                             &tex,
-                            (faces == 6).then_some(&cube as *const _),
+                            cube.as_ref().map(|d| d as *const _),
                             at,
                         );
                         keep.push(tex);

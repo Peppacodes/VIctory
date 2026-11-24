@@ -132,6 +132,12 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    // Debugging aid: `VICTORY_PATCH=<rva>:<hex bytes>,...` (hex) writes
+    // those bytes over the title before it starts.
+    if let Ok(list) = std::env::var("VICTORY_PATCH") {
+        let patches = victory_loader::parse_patches(&list);
+        victory_loader::patch_image(image.base(), image.info().size_of_image as usize, &patches);
+    }
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;

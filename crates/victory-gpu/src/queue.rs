@@ -289,6 +289,30 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
+        // With `VICTORY_PRESENT_1440P` (diagnostics builds): the frame's
+        // 2560x1440 world target instead of the title's plane, whose
+        // 1440p-to-4K pass outputs zero (#841).
+        #[cfg(feature = "diagnostics")]
+        let shown = match crate::capture::take_1440p_target() {
+            Some(copy) => {
+                let copy_state =
+                    crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed));
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    // SAFETY: a live host texture.
+                    let d = unsafe { copy.texture.GetDesc() };
+                    tracing::info!(
+                        width = d.Width,
+                        height = d.Height,
+                        format = d.Format.0,
+                        "VICTORY_PRESENT_1440P: presenting 2560x1440 world target as plane 0"
+                    );
+                });
+                host.present(&copy.texture, copy_state, frame)
+            }
+            None => host.present(texture, state, frame),
+        };
+        #[cfg(not(feature = "diagnostics"))]
         let shown = host.present(texture, state, frame);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]

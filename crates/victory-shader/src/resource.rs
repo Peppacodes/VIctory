@@ -517,6 +517,15 @@ impl<'a> Tracer<'a> {
                 dynamic: None,
             };
         }
+        if let Some(t) = self.readfirstlane(v) {
+            let through = self.sum(t);
+            // Only for a table in the code: a root parameter's address seen
+            // through a lane read keeps its old refusal.
+            if through.base.is_some_and(|b| self.getpc(b).is_some()) {
+                return through;
+            }
+            return dynamic;
+        }
         let Some([a, b]) = self
             .sop2(v, &["s_add_u32", "s_add_i32"])
             .map(|(_, t)| t)
@@ -533,6 +542,25 @@ impl<'a> Tracer<'a> {
             offset: x.offset.wrapping_add(y.offset),
             dynamic: x.dynamic.or(y.dynamic),
         }
+    }
+
+    /// The VGPR term a `v_readfirstlane_b32` writing `v` reads. The
+    /// console's compiler moves an address it computed with VALU additions
+    /// (a constant table in the code indexed by a computed value) back into
+    /// SGPRs this way before a scalar load.
+    // shortcut: the first lane's value is taken as every lane's; translated
+    // code reads each lane's own, which is the same for the uniform values
+    // these addresses are made from.
+    fn readfirstlane(&self, v: Value) -> Option<Term> {
+        let inst = self.def(v)?;
+        if inst.name() != "v_readfirstlane_b32" {
+            return None;
+        }
+        let Fields::Valu(f) = &inst.fields else {
+            return None;
+        };
+        let src = f.src.first()?;
+        self.vterm(inst, src)
     }
 
     /// The `s_getpc_b64` writing `lo` as its low dword.
@@ -705,6 +733,9 @@ impl<'a> Tracer<'a> {
         }
         if let Some((_, [a, b])) = self.sop2(v, &["s_addc_u32"]) {
             return self.carried(a, high) || self.carried(b, high);
+        }
+        if let Some(t) = self.readfirstlane(v) {
+            return self.carried(t, high);
         }
         let Some(inst) = self.def(v) else {
             return false;
@@ -3096,5 +3127,36 @@ pub(crate) mod tests {
         assert_eq!(table_offset(&r, other), 0x20);
         assert_eq!(r.waterfall.compares.len(), 2);
         assert_eq!(r.waterfall.reads.len(), 4);
+    }
+
+    #[test]
+    fn code_table_address_through_readfirstlane() {
+        // A constant table in the code indexed by a VALU-computed value,
+        // moved back to SGPRs with v_readfirstlane_b32 before the load.
+        let r = track_words(
+            &[
+                0xBE80_1F00, // s_getpc_b64 s[0:1]
+                0x8000_FF00,
+                0x0000_0DDC, // s_add_u32 s0, s0, lit(0xddc)
+                0x8201_8001, // s_addc_u32 s1, s1, 0
+                0xD6FF_0001,
+                0x0002_0082, // v_lshlrev_b64 v[1:2], 2, v[0:1]
+                0xD70F_6A01,
+                0x0000_0101, // v_add_co_u32 v1, vcc, v1, s0
+                0x5004_0401, // v_add_co_ci_u32 v2, vcc, s1, v2, vcc
+                0x7E04_0501, // v_readfirstlane_b32 s2, v1
+                0x7E06_0502, // v_readfirstlane_b32 s3, v2
+                0xF400_0181,
+                0xFA00_0000, // s_load_dword s6, s[2:3], null
+                S_ENDPGM,
+            ],
+            &[],
+            HwStage::Cs,
+        );
+        let [(_, a)] = r.scalar.as_slice() else {
+            panic!("{:?}", r.scalar);
+        };
+        assert_eq!((a.param, a.offset), (CODE, 4 + 0xDDC));
+        assert!(a.dynamic.is_some());
     }
 }

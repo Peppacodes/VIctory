@@ -720,6 +720,8 @@ impl State {
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
                     DRAWN.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    crate::capture::note_draw(&self.targets);
                     true
                 }
                 Err(_) => false,
@@ -983,6 +985,8 @@ impl State {
                     .DrawInstanced(count, instances, from, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_draw(&self.targets);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1070,6 +1074,8 @@ impl State {
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_draw(&self.targets);
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -1172,6 +1178,8 @@ impl State {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::note_draw(&self.targets);
         }
         true
     }

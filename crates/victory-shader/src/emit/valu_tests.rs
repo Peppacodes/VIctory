@@ -5,7 +5,7 @@
 //! `v_med3_f32`/`v_med3_f16` with NaN operands, `v_fract_f32`/`v_fract_f16`
 //! near `1.0`, and turn-range reduction for `v_sin_*`/`v_cos_*`.
 
-use super::host::{Dispatch, Host, Root, View};
+use super::host::{Dispatch, Host, ONE_AT_A_TIME, Root, View};
 use super::{HostShader, lower, validator};
 use crate::native::{
     ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
@@ -419,6 +419,45 @@ fn v_cmp_lg_is_false_for_nan() {
         let inputs: Vec<[u32; 4]> = cases.iter().map(|c| c.0).collect();
         run_cases(&shader, &inputs, |backend, i, inp, got| {
             let want = cases[i].1;
+            assert_eq!(
+                got, want,
+                "{backend}: {what}({:#010x}, {:#010x}) = {got}, want {want}",
+                inp[0], inp[1],
+            );
+        });
+    }
+}
+
+/// `v_cmp_f_*` is false and `v_cmp_tru_*` true whatever the operands, NaNs
+/// included (RDNA2 ISA). As `fcmp false`/`fcmp true` WARP removed its device
+/// at the first dispatch.
+#[test]
+fn float_compares_that_are_always_false_or_true() {
+    let nan = f32::NAN.to_bits();
+    let f = f32::to_bits;
+    let f32_inputs = [
+        [f(1.0), f(2.0), 0, 0],
+        [f(1.0), f(1.0), 0, 0],
+        [nan, f(1.0), 0, 0],
+        [nan, nan, 0, 0],
+    ];
+    let f16_inputs = [
+        [0x3C00, 0x4000, 0, 0],
+        [0x3C00, 0x3C00, 0, 0],
+        [0x7E00, 0x3C00, 0, 0],
+        [0x7E00, 0x7E00, 0, 0],
+    ];
+    // v_cmp_*_e64 s20, v1, v2; v_cndmask_b32_e64 v0, 0, 1, s20
+    for (op, what, inputs, want) in [
+        (0x000u16, "v_cmp_f_f32", f32_inputs, 0),
+        (0x00f, "v_cmp_tru_f32", f32_inputs, 1),
+        (0x0c8, "v_cmp_f_f16", f16_inputs, 0),
+        (0x0ef, "v_cmp_tru_f16", f16_inputs, 1),
+    ] {
+        let mut body = vop3(op, 20, vgpr(1), vgpr(2), 0x80).to_vec();
+        body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
+        let shader = build_valu_cs(&body);
+        run_cases(&shader, &inputs, |backend, _, inp, got| {
             assert_eq!(
                 got, want,
                 "{backend}: {what}({:#010x}, {:#010x}) = {got}, want {want}",

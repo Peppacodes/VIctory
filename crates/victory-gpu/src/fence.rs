@@ -1,10 +1,12 @@
-//! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
-//! GPU yet, so only signals (the title's, later our queues') move one.
+//! Fences: a 64-bit value and the events waiting for it. Signals (the
+//! title's and our queues') move one, and so does any write to its GPU
+//! address, such as a list's bottom-of-pipe write: [`poll`] then sets the
+//! events of the waiters it reached.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::object::{self, E_NOTIMPL, FENCE, HRESULT, Iid, Object, S_OK, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
@@ -32,6 +34,51 @@ struct Fence {
     waiters: Mutex<Vec<(u64, usize)>>,
 }
 
+impl Drop for Fence {
+    fn drop(&mut self) {
+        let me = std::ptr::from_ref(self) as usize;
+        live().retain(|&f| f != me);
+    }
+}
+
+/// Every fence alive, by address, for [`poll`]. A fence leaves it when
+/// dropped, under this lock, so one listed here is alive while it is held.
+static LIVE: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+fn live() -> MutexGuard<'static, Vec<usize>> {
+    LIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Sets the events of waiters whose fence value was reached without a
+/// signal: written at the fence's GPU address, which Grand Theft Auto VI
+/// does with lists' bottom-of-pipe writes. Run once such writes are done.
+pub(crate) fn poll() {
+    static SEEN: AtomicBool = AtomicBool::new(false);
+    let live = live();
+    for &f in live.iter() {
+        // SAFETY: listed, so alive (see `LIVE`).
+        let fence = unsafe { &*(f as *const Fence) };
+        let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
+        if waiters.is_empty() {
+            continue;
+        }
+        let value = fence.value.load(Ordering::Acquire);
+        waiters.retain(|&(wanted, event)| {
+            let reached = wanted <= value;
+            if reached {
+                if !SEEN.swap(true, Ordering::Relaxed) {
+                    tracing::info!(
+                        value,
+                        "a fence written at its GPU address, not signaled, set its waiting events"
+                    );
+                }
+                set_event(event);
+            }
+            !reached
+        });
+    }
+}
+
 fn fence<'a>(this: This) -> &'a Fence {
     // SAFETY: called from fence methods only.
     unsafe { &*this.cast::<Fence>() }
@@ -51,7 +98,15 @@ pub(crate) extern "system" fn create(
         flags,
         waiters: Mutex::new(Vec::new()),
     });
-    object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out)
+    let at = std::ptr::from_ref::<Fence>(&fence) as usize;
+    // Not under `LIVE`'s lock: a fence `hand_out` drops takes it.
+    let result = object::hand_out(FENCE, fence, iid, &FENCE_IIDS, out);
+    // Handed out (and not dropped): alive until its last release, which
+    // only the title can make, and not before this returns.
+    if result == S_OK && !out.is_null() {
+        live().push(at);
+    }
+    result
 }
 
 fn set_event(event: usize) {
@@ -169,5 +224,55 @@ mod tests {
         // SAFETY: ours.
         unsafe { CloseHandle(event) };
         assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+    }
+
+    /// A list's bottom-of-pipe write to the fence's GPU address moves its
+    /// value without a signal; the waiters it reached are set once polled.
+    #[cfg(windows)]
+    #[test]
+    fn writes_at_the_gpu_address_set_waiting_events_once_polled() {
+        use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        let mut f = std::ptr::null();
+        assert_eq!(create(std::ptr::null(), 0, 0, &FENCE_IIDS[0], &mut f), S_OK);
+        assert!(live().contains(&(f as usize)));
+        // SAFETY: plain auto-reset events.
+        let (near, far) = unsafe {
+            (
+                CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()),
+                CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()),
+            )
+        };
+        let wait = slot::<extern "system" fn(This, u64, *mut c_void) -> HRESULT>(f, 0x48);
+        assert_eq!(wait(f, 3, near), S_OK);
+        assert_eq!(wait(f, 9, far), S_OK);
+        let at = slot::<extern "system" fn(This) -> u64>(f, 0x60)(f);
+        crate::queue::Written::Value(3).write(at as *mut u8, 8);
+        poll();
+        // SAFETY: valid events.
+        unsafe {
+            assert_eq!(
+                WaitForSingleObject(near, 0),
+                WAIT_OBJECT_0,
+                "reached by the write"
+            );
+            assert_ne!(
+                WaitForSingleObject(far, 0),
+                WAIT_OBJECT_0,
+                "not reached yet"
+            );
+        }
+        assert_eq!(slot::<extern "system" fn(This) -> u32>(f, 0x10)(f), 0);
+        assert!(
+            !live().contains(&(f as usize)),
+            "a released fence leaves the list"
+        );
+        poll();
+        // SAFETY: ours.
+        unsafe {
+            CloseHandle(near);
+            CloseHandle(far);
+        }
     }
 }
